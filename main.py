@@ -1,12 +1,76 @@
+import os
+import hashlib
+import secrets
+import smtplib
 import sqlite3
 from datetime import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 DB = Path("data/hospital.db")
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "shikhar123")
+
+
+# ── Password hashing (pbkdf2, no extra deps) ──
+def hash_pw(pw: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100_000).hex()
+    return f"{salt}${h}"
+
+
+def verify_pw(pw: str, stored: str) -> bool:
+    try:
+        salt, h = stored.split("$")
+        return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 100_000).hex() == h
+    except Exception:
+        return False
+
+
+# ── Email (Gmail SMTP; no-op if not configured) ──
+def send_email(to_email: str, subject: str, html: str) -> bool:
+    smtp_email = os.getenv("SMTP_EMAIL", "")
+    smtp_password = os.getenv("SMTP_PASSWORD", "")
+    if not smtp_email or not smtp_password or not to_email:
+        return False
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = f"ShiKhar Hospital <{smtp_email}>"
+    msg["To"] = to_email
+    msg.attach(MIMEText(html, "html"))
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(smtp_email, smtp_password)
+            s.sendmail(smtp_email, to_email, msg.as_string())
+        return True
+    except Exception:
+        return False
+
+
+def appointment_email_html(a) -> str:
+    return f"""
+    <div style="font-family:Segoe UI,sans-serif;max-width:500px;margin:auto;border:1px solid #e2e8f0;border-radius:14px;padding:26px">
+      <div style="text-align:center;margin-bottom:16px">
+        <div style="display:inline-grid;place-items:center;width:46px;height:46px;border-radius:12px;background:#0d8578;color:#fff;font-size:22px">✚</div>
+        <h2 style="color:#106a61;margin:8px 0 0">ShiKhar Hospital</h2>
+        <p style="color:#64748b;font-size:13px;margin:2px 0">Appointment Confirmation</p>
+      </div>
+      <p>Hi <b>{a['patientName']}</b>, your appointment is <b style="color:#0d8578">confirmed</b>.</p>
+      <div style="background:#f0fdfa;border-radius:12px;padding:16px;margin:14px 0">
+        <div style="font-size:20px;font-weight:800;color:#106a61;letter-spacing:1px">{a['id']}</div>
+        <div style="margin-top:8px;font-size:14px">👨‍⚕️ <b>{a['doctorName']}</b> ({a.get('specialty','')})</div>
+        <div style="font-size:14px">📅 {a['date']} &nbsp; ⏰ {a['slot']}</div>
+        <div style="font-size:14px">💳 {a['payMethod']} — {'Paid ₹' + str(a['fee']) if a.get('paid') else 'Pay ₹' + str(a['fee']) + ' at hospital'}</div>
+      </div>
+      <p style="font-size:12.5px;color:#64748b">Please arrive 10 minutes early. To reschedule or cancel, visit your patient dashboard.</p>
+      <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:18px">Get well soon — ShiKhar Hospital</p>
+    </div>
+    """
 
 
 def con():
@@ -49,6 +113,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT, message TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS patients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT, email TEXT UNIQUE, phone TEXT,
+            password_hash TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY, email TEXT, is_admin INTEGER DEFAULT 0, created_at TEXT
         );
         """
     )
@@ -132,7 +204,7 @@ def booked_slots(doctorId: int, date: str):
 
 
 @app.post("/api/appointments")
-def create_appt(a: ApptIn):
+def create_appt(a: ApptIn, background: BackgroundTasks):
     c = con()
     # Prevent double-booking the same doctor + date + slot
     clash = c.execute(
@@ -155,7 +227,19 @@ def create_appt(a: ApptIn):
     c.commit()
     row = c.execute("SELECT * FROM appointments WHERE id=?", (aid,)).fetchone()
     c.close()
-    return _row_to_appt(row)
+    appt = _row_to_appt(row)
+    # send confirmation email (background — never blocks/breaks booking)
+    if a.patientEmail:
+        background.add_task(
+            send_email, a.patientEmail,
+            f"Appointment Confirmed — {aid}",
+            appointment_email_html({
+                "id": aid, "patientName": a.patientName, "doctorName": a.doctorName,
+                "specialty": a.specialty, "date": a.date, "slot": a.slot,
+                "payMethod": a.payMethod, "fee": a.fee, "paid": a.paid,
+            }),
+        )
+    return appt
 
 
 @app.get("/api/appointments")
@@ -305,3 +389,76 @@ def del_notif(nid: int):
     c.commit()
     c.close()
     return {"message": "deleted"}
+
+
+# ── Auth (patients + admin) ───────────────────────────
+class RegisterIn(BaseModel):
+    name: str
+    email: str
+    phone: str = ""
+    password: str
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class AdminLoginIn(BaseModel):
+    username: str
+    password: str
+
+
+def _issue_token(email: str, is_admin: int = 0) -> str:
+    tok = secrets.token_hex(24)
+    c = con()
+    c.execute("INSERT INTO sessions (token, email, is_admin, created_at) VALUES (?,?,?,?)",
+              (tok, email, is_admin, datetime.now().isoformat()))
+    c.commit()
+    c.close()
+    return tok
+
+
+@app.post("/api/auth/register")
+def register(r: RegisterIn):
+    if len(r.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    c = con()
+    exists = c.execute("SELECT 1 FROM patients WHERE email=?", (r.email.lower().strip(),)).fetchone()
+    if exists:
+        c.close()
+        raise HTTPException(400, "An account with this email already exists")
+    c.execute(
+        "INSERT INTO patients (name, email, phone, password_hash, created_at) VALUES (?,?,?,?,?)",
+        (r.name, r.email.lower().strip(), r.phone, hash_pw(r.password), datetime.now().isoformat()),
+    )
+    c.commit()
+    c.close()
+    return {"token": _issue_token(r.email.lower().strip()), "name": r.name, "email": r.email.lower().strip()}
+
+
+@app.post("/api/auth/login")
+def login(l: LoginIn):
+    c = con()
+    row = c.execute("SELECT * FROM patients WHERE email=?", (l.email.lower().strip(),)).fetchone()
+    c.close()
+    if not row or not verify_pw(l.password, row["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    return {"token": _issue_token(row["email"]), "name": row["name"], "email": row["email"]}
+
+
+@app.post("/api/auth/admin-login")
+def admin_login(a: AdminLoginIn):
+    if a.username != ADMIN_USER or a.password != ADMIN_PASS:
+        raise HTTPException(401, "Invalid admin credentials")
+    return {"token": _issue_token("__admin__", 1), "name": "Administrator"}
+
+
+@app.get("/api/auth/me")
+def me(token: str):
+    c = con()
+    row = c.execute("SELECT * FROM sessions WHERE token=?", (token,)).fetchone()
+    c.close()
+    if not row:
+        raise HTTPException(401, "Invalid token")
+    return {"email": row["email"], "isAdmin": bool(row["is_admin"])}

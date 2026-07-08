@@ -42,6 +42,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT, specialty_label TEXT, fee INTEGER, created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS blocked_dates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT, doctor_id INTEGER DEFAULT 0, reason TEXT, created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT, message TEXT, created_at TEXT
+        );
         """
     )
     c.commit()
@@ -198,6 +206,82 @@ def add_extra_doctor(d: DoctorIn):
 def del_extra_doctor(did: int):
     c = con()
     c.execute("DELETE FROM extra_doctors WHERE id=?", (did,))
+    c.commit()
+    c.close()
+    return {"message": "deleted"}
+
+
+# ── Blocked dates ─────────────────────────────────────
+class BlockIn(BaseModel):
+    date: str
+    doctorId: int = 0
+    reason: str = "Not Available"
+
+
+@app.get("/api/blocked-dates")
+def list_blocked(doctorId: int = 0):
+    c = con()
+    rows = c.execute("SELECT * FROM blocked_dates ORDER BY date").fetchall()
+    c.close()
+    out = [{"id": r["id"], "date": r["date"], "doctorId": r["doctor_id"], "reason": r["reason"]} for r in rows]
+    if doctorId:
+        out = [b for b in out if b["doctorId"] in (0, doctorId)]
+    return out
+
+
+@app.post("/api/blocked-dates")
+def add_blocked(b: BlockIn):
+    c = con()
+    cur = c.execute(
+        "INSERT INTO blocked_dates (date, doctor_id, reason, created_at) VALUES (?,?,?,?)",
+        (b.date, b.doctorId, b.reason, datetime.now().isoformat()),
+    )
+    c.commit()
+    bid = cur.lastrowid
+    c.close()
+    return {"id": bid, "date": b.date, "doctorId": b.doctorId, "reason": b.reason}
+
+
+@app.delete("/api/blocked-dates/{bid}")
+def del_blocked(bid: int):
+    c = con()
+    c.execute("DELETE FROM blocked_dates WHERE id=?", (bid,))
+    c.commit()
+    c.close()
+    return {"message": "deleted"}
+
+
+# ── Notifications ─────────────────────────────────────
+class NotifIn(BaseModel):
+    title: str
+    message: str = ""
+
+
+@app.get("/api/notifications")
+def list_notifs():
+    c = con()
+    rows = c.execute("SELECT * FROM notifications ORDER BY created_at DESC").fetchall()
+    c.close()
+    return [{"id": r["id"], "title": r["title"], "message": r["message"], "createdAt": r["created_at"]} for r in rows]
+
+
+@app.post("/api/notifications")
+def add_notif(n: NotifIn):
+    c = con()
+    cur = c.execute(
+        "INSERT INTO notifications (title, message, created_at) VALUES (?,?,?)",
+        (n.title, n.message, datetime.now().isoformat()),
+    )
+    c.commit()
+    nid = cur.lastrowid
+    c.close()
+    return {"id": nid, "title": n.title, "message": n.message}
+
+
+@app.delete("/api/notifications/{nid}")
+def del_notif(nid: int):
+    c = con()
+    c.execute("DELETE FROM notifications WHERE id=?", (nid,))
     c.commit()
     c.close()
     return {"message": "deleted"}

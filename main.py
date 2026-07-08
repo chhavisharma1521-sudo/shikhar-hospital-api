@@ -119,10 +119,30 @@ def _row_to_appt(r):
     }
 
 
+@app.get("/api/booked-slots")
+def booked_slots(doctorId: int, date: str):
+    """Slots already booked for a doctor on a date (so the UI can disable them)."""
+    c = con()
+    rows = c.execute(
+        "SELECT slot FROM appointments WHERE doctor_id=? AND date=? AND status != 'Cancelled'",
+        (doctorId, date),
+    ).fetchall()
+    c.close()
+    return [r["slot"] for r in rows]
+
+
 @app.post("/api/appointments")
 def create_appt(a: ApptIn):
-    aid = _appt_id()
     c = con()
+    # Prevent double-booking the same doctor + date + slot
+    clash = c.execute(
+        "SELECT 1 FROM appointments WHERE doctor_id=? AND date=? AND slot=? AND status != 'Cancelled'",
+        (a.doctorId, a.date, a.slot),
+    ).fetchone()
+    if clash:
+        c.close()
+        raise HTTPException(409, "This slot was just booked. Please pick another time.")
+    aid = _appt_id()
     c.execute(
         """INSERT INTO appointments
            (id,doctor_id,doctor_name,specialty,hospital,date,slot,fee,pay_method,status,paid,
